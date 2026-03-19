@@ -1,4 +1,5 @@
-import asyncio
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, NamedTuple
 
 import aiohttp
@@ -6,65 +7,160 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.shortcuts.choice_input import ChoiceInput
 from pydantic import SecretStr
 
-from kimi_cli.config import LLMModel, LLMProvider, MoonshotSearchConfig, load_config, save_config
+from kimi_cli import logger
+from kimi_cli.auth import KIMI_CODE_PLATFORM_ID
+from kimi_cli.auth.platforms import (
+    PLATFORMS,
+    ModelInfo,
+    Platform,
+    get_platform_by_name,
+    list_models,
+    managed_model_key,
+    managed_provider_key,
+)
+from kimi_cli.config import (
+    LLMModel,
+    LLMProvider,
+    MoonshotFetchConfig,
+    MoonshotSearchConfig,
+    load_config,
+    save_config,
+)
 from kimi_cli.ui.shell.console import console
-from kimi_cli.ui.shell.metacmd import meta_command
-from kimi_cli.utils.aiohttp import new_client_session
+from kimi_cli.ui.shell.slash import registry
 
 if TYPE_CHECKING:
-    from kimi_cli.ui.shell import ShellApp
+    from kimi_cli.ui.shell import Shell
 
 
-class _Platform(NamedTuple):
-    id: str
-    name: str
-    base_url: str
-    search_url: str | None = None
-    allowed_prefixes: list[str] | None = None
+async def select_platform() -> Platform | None:
+    platform_name = await _prompt_choice(
+        header="Select a platform (↑↓ navigate, Enter select, Ctrl+C cancel):",
+        choices=[platform.name for platform in PLATFORMS],
+    )
+    if not platform_name:
+        console.print("[red]No platform selected[/red]")
+        return None
+
+    platform = get_platform_by_name(platform_name)
+    if platform is None:
+        console.print("[red]Unknown platform[/red]")
+        return None
+    return platform
 
 
-_PLATFORMS = [
-    _Platform(
-        id="kimi-for-coding",
-        name="Kimi For Coding",
-        base_url="https://api.kimi.com/coding/v1",
-        search_url="https://api.kimi.com/coding/v1/search",
-    ),
-    _Platform(
-        id="moonshot-cn",
-        name="Moonshot AI 开放平台 (moonshot.cn)",
-        base_url="https://api.moonshot.cn/v1",
-        allowed_prefixes=["kimi-k2-"],
-    ),
-    _Platform(
-        id="moonshot-ai",
-        name="Moonshot AI Open Platform (moonshot.ai)",
-        base_url="https://api.moonshot.ai/v1",
-        allowed_prefixes=["kimi-k2-"],
-    ),
-]
-
-
-@meta_command
-async def setup(app: "ShellApp", args: list[str]):
-    """Setup Kimi CLI"""
-    result = await _setup()
+async def setup_platform(platform: Platform) -> bool:
+    result = await _setup_platform(platform)
     if not result:
         # error message already printed
-        return
+        return False
 
+    _apply_setup_result(result)
+    thinking_label = "on" if result.thinking else "off"
+    console.print("[green]✓ Setup complete![/green]")
+    console.print(f"  Platform: [bold]{result.platform.name}[/bold]")
+    console.print(f"  Model:    [bold]{result.selected_model.id}[/bold]")
+    console.print(f"  Thinking: [bold]{thinking_label}[/bold]")
+    console.print("  Reloading...")
+    return True
+
+
+class _SetupResult(NamedTuple):
+    platform: Platform
+    api_key: SecretStr
+    selected_model: ModelInfo
+    models: list[ModelInfo]
+    thinking: bool
+
+
+async def _setup_platform(platform: Platform) -> _SetupResult | None:
+    # enter the API key
+    api_key = await _prompt_text("Enter your API key", is_password=True)
+    if not api_key:
+        return None
+
+    # list models
+    try:
+        with console.status("[cyan]Verifying API key...[/cyan]"):
+            models = await list_models(platform, api_key)
+    except aiohttp.ClientResponseError as e:
+        logger.error("Failed to get models: {error}", error=e)
+        console.print(f"[red]Failed to get models: {e.message}[/red]")
+        if e.status == 401 and platform.id != KIMI_CODE_PLATFORM_ID:
+            console.print(
+                "[yellow]Hint: If your API key was obtained from Kimi Code, "
+                'please select "Kimi Code" instead.[/yellow]'
+            )
+        return None
+    except Exception as e:
+        logger.error("Failed to get models: {error}", error=e)
+        console.print(f"[red]Failed to get models: {e}[/red]")
+        return None
+
+    # select the model
+    if not models:
+        console.print("[red]No models available for the selected platform[/red]")
+        return None
+
+    model_map = {model.id: model for model in models}
+    model_id = await _prompt_choice(
+        header="Select a model (↑↓ navigate, Enter select, Ctrl+C cancel):",
+        choices=list(model_map),
+    )
+    if not model_id:
+        console.print("[red]No model selected[/red]")
+        return None
+
+    selected_model = model_map[model_id]
+
+    # Determine thinking mode based on model capabilities
+    capabilities = selected_model.capabilities
+    thinking: bool
+
+    if "always_thinking" in capabilities:
+        thinking = True
+    elif "thinking" in capabilities:
+        thinking_selection = await _prompt_choice(
+            header="Enable thinking mode? (↑↓ navigate, Enter select, Ctrl+C cancel):",
+            choices=["on", "off"],
+        )
+        if not thinking_selection:
+            return None
+        thinking = thinking_selection == "on"
+    else:
+        thinking = False
+
+    return _SetupResult(
+        platform=platform,
+        api_key=SecretStr(api_key),
+        selected_model=selected_model,
+        models=models,
+        thinking=thinking,
+    )
+
+
+def _apply_setup_result(result: _SetupResult) -> None:
     config = load_config()
-    config.providers[result.platform.id] = LLMProvider(
+    provider_key = managed_provider_key(result.platform.id)
+    model_key = managed_model_key(result.platform.id, result.selected_model.id)
+    config.providers[provider_key] = LLMProvider(
         type="kimi",
         base_url=result.platform.base_url,
         api_key=result.api_key,
     )
-    config.models[result.model_id] = LLMModel(
-        provider=result.platform.id,
-        model=result.model_id,
-        max_context_size=result.max_context_size,
-    )
-    config.default_model = result.model_id
+    for key, model in list(config.models.items()):
+        if model.provider == provider_key:
+            del config.models[key]
+    for model_info in result.models:
+        capabilities = model_info.capabilities or None
+        config.models[managed_model_key(result.platform.id, model_info.id)] = LLMModel(
+            provider=provider_key,
+            model=model_info.id,
+            max_context_size=model_info.context_length,
+            capabilities=capabilities,
+        )
+    config.default_model = model_key
+    config.default_thinking = result.thinking
 
     if result.platform.search_url:
         config.services.moonshot_search = MoonshotSearchConfig(
@@ -72,89 +168,13 @@ async def setup(app: "ShellApp", args: list[str]):
             api_key=result.api_key,
         )
 
+    if result.platform.fetch_url:
+        config.services.moonshot_fetch = MoonshotFetchConfig(
+            base_url=result.platform.fetch_url,
+            api_key=result.api_key,
+        )
+
     save_config(config)
-    console.print("[green]✓[/green] Kimi CLI has been setup! Reloading...")
-    await asyncio.sleep(1)
-    console.clear()
-
-    from kimi_cli.cli import Reload
-
-    raise Reload
-
-
-class _SetupResult(NamedTuple):
-    platform: _Platform
-    api_key: SecretStr
-    model_id: str
-    max_context_size: int
-
-
-async def _setup() -> _SetupResult | None:
-    # select the API platform
-    platform_name = await _prompt_choice(
-        header="Select the API platform",
-        choices=[platform.name for platform in _PLATFORMS],
-    )
-    if not platform_name:
-        console.print("[red]No platform selected[/red]")
-        return None
-
-    platform = next(platform for platform in _PLATFORMS if platform.name == platform_name)
-
-    # enter the API key
-    api_key = await _prompt_text("Enter your API key", is_password=True)
-    if not api_key:
-        return None
-
-    # list models
-    models_url = f"{platform.base_url}/models"
-    try:
-        async with (
-            new_client_session() as session,
-            session.get(
-                models_url,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                },
-                raise_for_status=True,
-            ) as response,
-        ):
-            resp_json = await response.json()
-    except aiohttp.ClientError as e:
-        console.print(f"[red]Failed to get models: {e}[/red]")
-        return None
-
-    model_dict = {model["id"]: model for model in resp_json["data"]}
-
-    # select the model
-    model_ids: list[str] = [model["id"] for model in resp_json["data"]]
-    if platform.allowed_prefixes is not None:
-        model_ids = [
-            model_id
-            for model_id in model_ids
-            if model_id.startswith(tuple(platform.allowed_prefixes))
-        ]
-
-    if not model_ids:
-        console.print("[red]No models available for the selected platform[/red]")
-        return None
-
-    model_id = await _prompt_choice(
-        header="Select the model",
-        choices=model_ids,
-    )
-    if not model_id:
-        console.print("[red]No model selected[/red]")
-        return None
-
-    model = model_dict[model_id]
-
-    return _SetupResult(
-        platform=platform,
-        api_key=SecretStr(api_key),
-        model_id=model_id,
-        max_context_size=model["context_length"],
-    )
 
 
 async def _prompt_choice(*, header: str, choices: list[str]) -> str | None:
@@ -172,7 +192,7 @@ async def _prompt_choice(*, header: str, choices: list[str]) -> str | None:
 
 
 async def _prompt_text(prompt: str, *, is_password: bool = False) -> str | None:
-    session = PromptSession()
+    session = PromptSession[str]()
     try:
         return str(
             await session.prompt_async(
@@ -184,8 +204,8 @@ async def _prompt_text(prompt: str, *, is_password: bool = False) -> str | None:
         return None
 
 
-@meta_command
-def reload(app: "ShellApp", args: list[str]):
+@registry.command
+def reload(app: Shell, args: str):
     """Reload configuration"""
     from kimi_cli.cli import Reload
 

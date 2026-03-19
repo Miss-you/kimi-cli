@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import platform
@@ -19,6 +21,9 @@ from kimi_cli.utils.logging import logger
 BASE_URL = "https://cdn.kimi.com/binaries/kimi-cli"
 LATEST_VERSION_URL = f"{BASE_URL}/latest"
 INSTALL_DIR = Path.home() / ".local" / "bin"
+
+# Upgrade command shown in toast notifications. Can be overridden by wrappers
+UPGRADE_COMMAND = "uv tool upgrade kimi-cli"
 
 
 class UpdateResult(Enum):
@@ -194,17 +199,17 @@ async def _do_update(*, print: bool, check_only: bool) -> UpdateResult:
                 return UpdateResult.FAILED
 
     _print("[green]Updated successfully![/green]")
-    _print("[yellow]Restart Kimi CLI to use the new version.[/yellow]")
+    _print("[yellow]Restart Kimi Code CLI to use the new version.[/yellow]")
     return UpdateResult.UPDATED
 
 
 # @meta_command
-# async def update(app: "ShellApp", args: list[str]):
+# async def update(app: "Shell", args: list[str]):
 #     """Check for updates"""
 #     await do_update(print=True)
 
 
 # @meta_command(name="check-update")
-# async def check_update(app: "ShellApp", args: list[str]):
+# async def check_update(app: "Shell", args: list[str]):
 #     """Check for updates"""
 #     await do_update(print=True, check_only=True)

@@ -1,18 +1,30 @@
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal, override
+from typing import Literal, override
 
-import aiofiles
-from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnType
+from kaos.path import KaosPath
+from kosong.tooling import CallableTool2, ToolError, ToolReturnValue
 from pydantic import BaseModel, Field
 
+from kimi_cli.soul.agent import Runtime
 from kimi_cli.soul.approval import Approval
-from kimi_cli.soul.runtime import BuiltinSystemPromptArgs
+from kimi_cli.tools.display import DisplayBlock
 from kimi_cli.tools.file import FileActions
+from kimi_cli.tools.file.plan_mode import inspect_plan_edit_target
 from kimi_cli.tools.utils import ToolRejectedError, load_desc
+from kimi_cli.utils.diff import build_diff_blocks
+from kimi_cli.utils.path import is_within_workspace
+
+_BASE_DESCRIPTION = load_desc(Path(__file__).parent / "write.md")
 
 
 class Params(BaseModel):
-    path: str = Field(description="The absolute path to the file to write")
+    path: str = Field(
+        description=(
+            "The path to the file to write. Absolute paths are required when writing files "
+            "outside the working directory."
+        )
+    )
     content: str = Field(description="The content to write to the file")
     mode: Literal["overwrite", "append"] = Field(
         description=(
@@ -26,54 +38,72 @@ class Params(BaseModel):
 
 class WriteFile(CallableTool2[Params]):
     name: str = "WriteFile"
-    description: str = load_desc(Path(__file__).parent / "write.md")
+    description: str = _BASE_DESCRIPTION
     params: type[Params] = Params
 
-    def __init__(self, builtin_args: BuiltinSystemPromptArgs, approval: Approval, **kwargs: Any):
-        super().__init__(**kwargs)
-        self._work_dir = builtin_args.KIMI_WORK_DIR
+    def __init__(self, runtime: Runtime, approval: Approval):
+        super().__init__()
+        self._work_dir = runtime.builtin_args.KIMI_WORK_DIR
+        self._additional_dirs = runtime.additional_dirs
         self._approval = approval
+        self._plan_mode_checker: Callable[[], bool] | None = None
+        self._plan_file_path_getter: Callable[[], Path | None] | None = None
 
-    def _validate_path(self, path: Path) -> ToolError | None:
+    def bind_plan_mode(
+        self, checker: Callable[[], bool], path_getter: Callable[[], Path | None]
+    ) -> None:
+        """Bind plan mode state checker and plan file path getter."""
+        self._plan_mode_checker = checker
+        self._plan_file_path_getter = path_getter
+
+    async def _validate_path(self, path: KaosPath) -> ToolError | None:
         """Validate that the path is safe to write."""
-        # Check for path traversal attempts
-        resolved_path = path.resolve()
-        resolved_work_dir = self._work_dir.resolve()
+        resolved_path = path.canonical()
 
-        # Ensure the path is within work directory
-        if not str(resolved_path).startswith(str(resolved_work_dir)):
+        if (
+            not is_within_workspace(resolved_path, self._work_dir, self._additional_dirs)
+            and not path.is_absolute()
+        ):
             return ToolError(
                 message=(
-                    f"`{path}` is outside the working directory. "
-                    "You can only write files within the working directory."
+                    f"`{path}` is not an absolute path. "
+                    "You must provide an absolute path to write a file "
+                    "outside the working directory."
                 ),
-                brief="Path outside working directory",
+                brief="Invalid path",
             )
         return None
 
     @override
-    async def __call__(self, params: Params) -> ToolReturnType:
+    async def __call__(self, params: Params) -> ToolReturnValue:
         # TODO: checks:
         # - check if the path may contain secrets
-        # - check if the file format is writable
+        if not params.path:
+            return ToolError(
+                message="File path cannot be empty.",
+                brief="Empty file path",
+            )
+
         try:
-            p = Path(params.path)
+            p = KaosPath(params.path).expanduser()
 
-            if not p.is_absolute():
-                return ToolError(
-                    message=(
-                        f"`{params.path}` is not an absolute path. "
-                        "You must provide an absolute path to write a file."
-                    ),
-                    brief="Invalid path",
-                )
+            if err := await self._validate_path(p):
+                return err
+            p = p.canonical()
 
-            # Validate path safety
-            path_error = self._validate_path(p)
-            if path_error:
-                return path_error
+            plan_target = inspect_plan_edit_target(
+                p,
+                plan_mode_checker=self._plan_mode_checker,
+                plan_file_path_getter=self._plan_file_path_getter,
+            )
+            if isinstance(plan_target, ToolError):
+                return plan_target
 
-            if not p.parent.exists():
+            is_plan_file_write = plan_target.is_plan_target
+            if is_plan_file_write and plan_target.plan_path is not None:
+                plan_target.plan_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if not await p.parent.exists():
                 return ToolError(
                     message=f"`{params.path}` parent directory does not exist.",
                     brief="Parent directory not found",
@@ -89,27 +119,54 @@ class WriteFile(CallableTool2[Params]):
                     brief="Invalid write mode",
                 )
 
-            # Request approval
-            if not await self._approval.request(
-                self.name,
-                FileActions.EDIT,
-                f"Write file `{params.path}`",
-            ):
-                return ToolRejectedError()
+            file_existed = await p.exists()
+            old_text = None
+            if file_existed:
+                old_text = await p.read_text(errors="replace")
 
-            # Determine file mode for aiofiles
-            file_mode = "w" if params.mode == "overwrite" else "a"
+            new_text = (
+                params.content if params.mode == "overwrite" else (old_text or "") + params.content
+            )
+            diff_blocks: list[DisplayBlock] = list(
+                build_diff_blocks(
+                    str(p),
+                    old_text or "",
+                    new_text,
+                )
+            )
+
+            # Plan file writes are auto-approved; other writes need approval
+            if not is_plan_file_write:
+                action = (
+                    FileActions.EDIT
+                    if is_within_workspace(p, self._work_dir, self._additional_dirs)
+                    else FileActions.EDIT_OUTSIDE
+                )
+
+                # Request approval
+                if not await self._approval.request(
+                    self.name,
+                    action,
+                    f"Write file `{p}`",
+                    display=diff_blocks,
+                ):
+                    return ToolRejectedError()
 
             # Write content to file
-            async with aiofiles.open(p, mode=file_mode, encoding="utf-8") as f:
-                await f.write(params.content)
+            match params.mode:
+                case "overwrite":
+                    await p.write_text(params.content)
+                case "append":
+                    await p.append_text(params.content)
 
             # Get file info for success message
-            file_size = p.stat().st_size
+            file_size = (await p.stat()).st_size
             action = "overwritten" if params.mode == "overwrite" else "appended to"
-            return ToolOk(
+            return ToolReturnValue(
+                is_error=False,
                 output="",
                 message=(f"File successfully {action}. Current size: {file_size} bytes."),
+                display=diff_blocks,
             )
 
         except Exception as e:

@@ -1,97 +1,357 @@
+from __future__ import annotations
+
 import asyncio
-from collections.abc import Awaitable, Coroutine
+import contextlib
+import shlex
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from kosong.chat_provider import APIStatusError, ChatProviderError
-from kosong.message import ContentPart
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from kimi_cli import logger
+from kimi_cli.notifications import NotificationWatcher
 from kimi_cli.soul import LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul
 from kimi_cli.soul.kimisoul import KimiSoul
+from kimi_cli.ui.shell import update as _update_mod
 from kimi_cli.ui.shell.console import console
-from kimi_cli.ui.shell.metacmd import get_meta_command
-from kimi_cli.ui.shell.prompt import CustomPromptSession, PromptMode, toast
+from kimi_cli.ui.shell.echo import render_user_echo_text
+from kimi_cli.ui.shell.mcp_status import render_mcp_prompt
+from kimi_cli.ui.shell.prompt import (
+    CustomPromptSession,
+    PromptMode,
+    UserInput,
+    toast,
+)
 from kimi_cli.ui.shell.replay import replay_recent_history
+from kimi_cli.ui.shell.slash import registry as shell_slash_registry
+from kimi_cli.ui.shell.slash import shell_mode_registry
 from kimi_cli.ui.shell.update import LATEST_VERSION_FILE, UpdateResult, do_update, semver_tuple
 from kimi_cli.ui.shell.visualize import visualize
-from kimi_cli.utils.logging import logger
+from kimi_cli.utils.envvar import get_env_bool
+from kimi_cli.utils.logging import open_original_stderr
 from kimi_cli.utils.signals import install_sigint_handler
-from kimi_cli.utils.term import ensure_new_line
+from kimi_cli.utils.slashcmd import SlashCommand, SlashCommandCall, parse_slash_command_call
+from kimi_cli.utils.subprocess_env import get_clean_env
+from kimi_cli.utils.term import ensure_new_line, ensure_tty_sane
+from kimi_cli.wire.types import ContentPart, StatusUpdate
 
 
-class ShellApp:
-    def __init__(self, soul: Soul, welcome_info: list["WelcomeInfoItem"] | None = None):
+@dataclass(slots=True)
+class _PromptEvent:
+    kind: str
+    user_input: UserInput | None = None
+
+
+class Shell:
+    def __init__(self, soul: Soul, welcome_info: list[WelcomeInfoItem] | None = None):
         self.soul = soul
         self._welcome_info = list(welcome_info or [])
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._prompt_session: CustomPromptSession | None = None
+        self._running_input_handler: Callable[[UserInput], None] | None = None
+        self._running_interrupt_handler: Callable[[], None] | None = None
+        self._exit_after_run = False
+        self._available_slash_commands: dict[str, SlashCommand[Any]] = {
+            **{cmd.name: cmd for cmd in soul.available_slash_commands},
+            **{cmd.name: cmd for cmd in shell_slash_registry.list_commands()},
+        }
+        """Shell-level slash commands + soul-level slash commands. Name to command mapping."""
+
+    @property
+    def available_slash_commands(self) -> dict[str, SlashCommand[Any]]:
+        """Get all available slash commands, including shell-level and soul-level commands."""
+        return self._available_slash_commands
+
+    @staticmethod
+    def _should_exit_input(user_input: UserInput) -> bool:
+        return user_input.command.strip() in {"exit", "quit", "/exit", "/quit"}
+
+    @staticmethod
+    def _agent_slash_command_call(user_input: UserInput) -> SlashCommandCall | None:
+        if user_input.mode != PromptMode.AGENT:
+            return None
+        display_call = parse_slash_command_call(user_input.command)
+        if display_call is None:
+            return None
+        resolved_call = parse_slash_command_call(user_input.resolved_command)
+        if resolved_call is None or resolved_call.name != display_call.name:
+            return display_call
+        return resolved_call
+
+    @staticmethod
+    def _should_echo_agent_input(user_input: UserInput) -> bool:
+        if user_input.mode != PromptMode.AGENT:
+            return False
+        if Shell._should_exit_input(user_input):
+            return False
+        return Shell._agent_slash_command_call(user_input) is None
+
+    @staticmethod
+    def _echo_agent_input(user_input: UserInput) -> None:
+        console.print(render_user_echo_text(user_input.command))
+
+    def _bind_running_input(
+        self,
+        on_input: Callable[[UserInput], None],
+        on_interrupt: Callable[[], None],
+    ) -> None:
+        self._running_input_handler = on_input
+        self._running_interrupt_handler = on_interrupt
+
+    def _unbind_running_input(self) -> None:
+        self._running_input_handler = None
+        self._running_interrupt_handler = None
+
+    async def _route_prompt_events(
+        self,
+        prompt_session: CustomPromptSession,
+        idle_events: asyncio.Queue[_PromptEvent],
+        resume_prompt: asyncio.Event,
+    ) -> None:
+        while True:
+            # Keep exactly one active prompt read. Idle submissions pause the
+            # router until the shell decides whether the next prompt should
+            # wait for a blocking action or stay live during an agent run.
+            await resume_prompt.wait()
+            ensure_tty_sane()
+            try:
+                ensure_new_line()
+                user_input = await prompt_session.prompt_next()
+            except KeyboardInterrupt:
+                logger.debug("Prompt router got KeyboardInterrupt")
+                if self._running_input_handler is not None:
+                    if self._running_interrupt_handler is not None:
+                        self._running_interrupt_handler()
+                    continue
+                resume_prompt.clear()
+                await idle_events.put(_PromptEvent(kind="interrupt"))
+                continue
+            except EOFError:
+                logger.debug("Prompt router got EOF")
+                if self._running_input_handler is not None:
+                    self._exit_after_run = True
+                    if self._running_interrupt_handler is not None:
+                        self._running_interrupt_handler()
+                    return
+                resume_prompt.clear()
+                await idle_events.put(_PromptEvent(kind="eof"))
+                return
+            except Exception:
+                logger.exception("Prompt router crashed")
+                resume_prompt.clear()
+                await idle_events.put(_PromptEvent(kind="error"))
+                return
+
+            if prompt_session.last_submission_was_running:  # noqa: SIM102
+                if self._running_input_handler is not None:
+                    if user_input:
+                        self._running_input_handler(user_input)
+                    continue
+                # Handler already unbound — fall through to idle path.
+
+            resume_prompt.clear()
+            await idle_events.put(_PromptEvent(kind="input", user_input=user_input))
 
     async def run(self, command: str | None = None) -> bool:
         if command is not None:
             # run single command and exit
             logger.info("Running agent with command: {command}", command=command)
-            return await self._run_soul_command(command)
+            return await self.run_soul_command(command)
 
-        self._start_background_task(self._auto_update())
+        # Start auto-update background task if not disabled
+        if get_env_bool("KIMI_CLI_NO_AUTO_UPDATE"):
+            logger.info("Auto-update disabled by KIMI_CLI_NO_AUTO_UPDATE environment variable")
+        else:
+            self._start_background_task(self._auto_update())
 
-        _print_welcome_info(self.soul.name or "Kimi CLI", self._welcome_info)
+        _print_welcome_info(self.soul.name or "Kimi Code CLI", self._welcome_info)
 
         if isinstance(self.soul, KimiSoul):
-            await replay_recent_history(self.soul.context.history)
+            watcher = NotificationWatcher(
+                self.soul.runtime.notifications,
+                sink="shell",
+                before_poll=self.soul.runtime.background_tasks.reconcile,
+                on_notification=lambda notification: toast(
+                    f"[{notification.event.type}] {notification.event.title}",
+                    topic="notification",
+                    duration=10.0,
+                ),
+            )
+            self._start_background_task(watcher.run_forever())
+            await replay_recent_history(
+                self.soul.context.history,
+                wire_file=self.soul.wire_file,
+            )
+            await self.soul.start_background_mcp_loading()
+
+        async def _plan_mode_toggle() -> bool:
+            if isinstance(self.soul, KimiSoul):
+                return await self.soul.toggle_plan_mode_from_manual()
+            return False
+
+        def _mcp_status_block(columns: int):
+            if not isinstance(self.soul, KimiSoul):
+                return None
+            snapshot = self.soul.status.mcp_status
+            if snapshot is None:
+                return None
+            return render_mcp_prompt(snapshot)
+
+        def _mcp_status_loading() -> bool:
+            if not isinstance(self.soul, KimiSoul):
+                return False
+            snapshot = self.soul.status.mcp_status
+            return bool(snapshot and snapshot.loading)
 
         with CustomPromptSession(
             status_provider=lambda: self.soul.status,
+            status_block_provider=_mcp_status_block,
+            fast_refresh_provider=_mcp_status_loading,
             model_capabilities=self.soul.model_capabilities or set(),
-            initial_thinking=isinstance(self.soul, KimiSoul) and self.soul.thinking,
+            model_name=self.soul.model_name,
+            thinking=self.soul.thinking or False,
+            agent_mode_slash_commands=list(self._available_slash_commands.values()),
+            shell_mode_slash_commands=shell_mode_registry.list_commands(),
+            editor_command_provider=lambda: (
+                self.soul.runtime.config.default_editor if isinstance(self.soul, KimiSoul) else ""
+            ),
+            plan_mode_toggle_callback=_plan_mode_toggle,
         ) as prompt_session:
-            while True:
-                try:
-                    ensure_new_line()
-                    user_input = await prompt_session.prompt()
-                except KeyboardInterrupt:
-                    logger.debug("Exiting by KeyboardInterrupt")
-                    console.print("[grey50]Tip: press Ctrl-D or send 'exit' to quit[/grey50]")
-                    continue
-                except EOFError:
-                    logger.debug("Exiting by EOF")
-                    console.print("Bye!")
-                    break
+            self._prompt_session = prompt_session
+            if isinstance(self.soul, KimiSoul):
+                kimi_soul = self.soul
+                snapshot = kimi_soul.status.mcp_status
+                if snapshot and snapshot.loading:
 
-                if not user_input:
-                    logger.debug("Got empty input, skipping")
-                    continue
-                logger.debug("Got user input: {user_input}", user_input=user_input)
+                    async def _invalidate_after_mcp_loading() -> None:
+                        try:
+                            await kimi_soul.wait_for_background_mcp_loading()
+                        except Exception:
+                            logger.debug("MCP loading finished with error while refreshing prompt")
+                        if self._prompt_session is prompt_session:
+                            prompt_session.invalidate()
 
-                if user_input.command in ["exit", "quit", "/exit", "/quit"]:
-                    logger.debug("Exiting by meta command")
-                    console.print("Bye!")
-                    break
+                    self._start_background_task(_invalidate_after_mcp_loading())
+            self._exit_after_run = False
+            idle_events: asyncio.Queue[_PromptEvent] = asyncio.Queue()
+            # resume_prompt controls whether the prompt router reads input.
+            # Set BEFORE an await = prompt stays live during the operation
+            # (agent runs that accept steer input); set AFTER = prompt is
+            # paused until the operation finishes.
+            resume_prompt = asyncio.Event()
+            resume_prompt.set()
+            prompt_task = asyncio.create_task(
+                self._route_prompt_events(prompt_session, idle_events, resume_prompt)
+            )
+            shell_ok = True
+            try:
+                while True:
+                    event = await idle_events.get()
 
-                if user_input.mode == PromptMode.SHELL:
-                    await self._run_shell_command(user_input.command)
-                    continue
+                    if event.kind == "interrupt":
+                        console.print("[grey50]Tip: press Ctrl-D or send 'exit' to quit[/grey50]")
+                        resume_prompt.set()
+                        continue
 
-                if user_input.command.startswith("/"):
-                    logger.debug("Running meta command: {command}", command=user_input.command)
-                    await self._run_meta_command(user_input.command[1:])
-                    continue
+                    if event.kind == "eof":
+                        console.print("Bye!")
+                        break
 
-                logger.info(
-                    "Running agent command: {command} with thinking {thinking}",
-                    command=user_input.content,
-                    thinking="on" if user_input.thinking else "off",
-                )
-                await self._run_soul_command(user_input.content, user_input.thinking)
+                    if event.kind == "error":
+                        shell_ok = False
+                        break
 
-        return True
+                    user_input = event.user_input
+                    assert user_input is not None
+                    if not user_input:
+                        logger.debug("Got empty input, skipping")
+                        resume_prompt.set()
+                        continue
+                    logger.debug("Got user input: {user_input}", user_input=user_input)
+
+                    if self._should_echo_agent_input(user_input):
+                        self._echo_agent_input(user_input)
+
+                    if self._should_exit_input(user_input):
+                        logger.debug("Exiting by slash command")
+                        console.print("Bye!")
+                        break
+
+                    if user_input.mode == PromptMode.SHELL:
+                        await self._run_shell_command(user_input.command)
+                        resume_prompt.set()
+                        continue
+
+                    if slash_cmd_call := self._agent_slash_command_call(user_input):
+                        is_soul_slash = (
+                            slash_cmd_call.name in self._available_slash_commands
+                            and shell_slash_registry.find_command(slash_cmd_call.name) is None
+                        )
+                        if is_soul_slash:
+                            resume_prompt.set()
+                            await self.run_soul_command(slash_cmd_call.raw_input)
+                            console.print()
+                            if self._exit_after_run:
+                                console.print("Bye!")
+                                break
+                        else:
+                            await self._run_slash_command(slash_cmd_call)
+                            resume_prompt.set()
+                        continue
+
+                    resume_prompt.set()
+                    await self.run_soul_command(user_input.content)
+                    console.print()
+                    if self._exit_after_run:
+                        console.print("Bye!")
+                        break
+            finally:
+                prompt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await prompt_task
+                self._running_input_handler = None
+                self._running_interrupt_handler = None
+                self._prompt_session = None
+                self._cancel_background_tasks()
+                ensure_tty_sane()
+
+        return shell_ok
 
     async def _run_shell_command(self, command: str) -> None:
         """Run a shell command in foreground."""
         if not command.strip():
+            return
+
+        # Check if it's an allowed slash command in shell mode
+        if slash_cmd_call := parse_slash_command_call(command):
+            if shell_mode_registry.find_command(slash_cmd_call.name):
+                await self._run_slash_command(slash_cmd_call)
+                return
+            else:
+                console.print(
+                    f'[yellow]"/{slash_cmd_call.name}" is not available in shell mode. '
+                    "Press Ctrl-X to switch to agent mode.[/yellow]"
+                )
+                return
+
+        # Check if user is trying to use 'cd' command
+        stripped_cmd = command.strip()
+        split_cmd: list[str] | None = None
+        try:
+            split_cmd = shlex.split(stripped_cmd)
+        except ValueError as exc:
+            logger.debug("Failed to parse shell command for cd check: {error}", error=exc)
+        if split_cmd and len(split_cmd) == 2 and split_cmd[0] == "cd":
+            console.print(
+                "[yellow]Warning: Directory changes are not preserved across command executions."
+                "[/yellow]"
+            )
             return
 
         logger.info("Running shell command: {cmd}", cmd=command)
@@ -108,64 +368,66 @@ class ShellApp:
         try:
             # TODO: For the sake of simplicity, we now use `create_subprocess_shell`.
             # Later we should consider making this behave like a real shell.
-            proc = await asyncio.create_subprocess_shell(command)
-            await proc.wait()
+            with open_original_stderr() as stderr:
+                kwargs: dict[str, Any] = {}
+                if stderr is not None:
+                    kwargs["stderr"] = stderr
+                proc = await asyncio.create_subprocess_shell(command, env=get_clean_env(), **kwargs)
+                await proc.wait()
         except Exception as e:
             logger.exception("Failed to run shell command:")
             console.print(f"[red]Failed to run shell command: {e}[/red]")
         finally:
             remove_sigint()
 
-    async def _run_meta_command(self, command_str: str):
-        from kimi_cli.cli import Reload
+    async def _run_slash_command(self, command_call: SlashCommandCall) -> None:
+        from kimi_cli.cli import Reload, SwitchToWeb
 
-        parts = command_str.split(" ")
-        command_name = parts[0]
-        command_args = parts[1:]
-        command = get_meta_command(command_name)
+        if command_call.name not in self._available_slash_commands:
+            logger.info("Unknown slash command /{command}", command=command_call.name)
+            console.print(
+                f'[red]Unknown slash command "/{command_call.name}", '
+                'type "/" for all available commands[/red]'
+            )
+            return
+
+        command = shell_slash_registry.find_command(command_call.name)
         if command is None:
-            console.print(f"Meta command /{command_name} not found")
+            # the input is a soul-level slash command call
+            await self.run_soul_command(command_call.raw_input)
             return
-        if command.kimi_soul_only and not isinstance(self.soul, KimiSoul):
-            console.print(f"Meta command /{command_name} not supported")
-            return
+
         logger.debug(
-            "Running meta command: {command_name} with args: {command_args}",
-            command_name=command_name,
-            command_args=command_args,
+            "Running shell-level slash command: /{command} with args: {args}",
+            command=command_call.name,
+            args=command_call.args,
         )
+
         try:
-            ret = command.func(self, command_args)
+            ret = command.func(self, command_call.args)
             if isinstance(ret, Awaitable):
                 await ret
-        except LLMNotSet:
-            logger.error("LLM not set")
-            console.print("[red]LLM not set, send /setup to configure[/red]")
-        except ChatProviderError as e:
-            logger.exception("LLM provider error:")
-            console.print(f"[red]LLM provider error: {e}[/red]")
-        except asyncio.CancelledError:
-            logger.info("Interrupted by user")
-            console.print("[red]Interrupted by user[/red]")
-        except Reload:
+        except (Reload, SwitchToWeb):
             # just propagate
             raise
-        except BaseException as e:
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # Handle Ctrl-C during slash command execution, return to shell prompt
+            logger.debug("Slash command interrupted by KeyboardInterrupt")
+            console.print("[red]Interrupted by user[/red]")
+        except Exception as e:
             logger.exception("Unknown error:")
             console.print(f"[red]Unknown error: {e}[/red]")
             raise  # re-raise unknown error
 
-    async def _run_soul_command(
-        self,
-        user_input: str | list[ContentPart],
-        thinking: bool | None = None,
-    ) -> bool:
+    async def run_soul_command(self, user_input: str | list[ContentPart]) -> bool:
         """
         Run the soul and handle any known exceptions.
 
         Returns:
             bool: Whether the run is successful.
         """
+        logger.info("Running soul with user input: {user_input}", user_input=user_input)
+
         cancel_event = asyncio.Event()
 
         def _handler():
@@ -176,36 +438,41 @@ class ShellApp:
         remove_sigint = install_sigint_handler(loop, _handler)
 
         try:
-            if isinstance(self.soul, KimiSoul) and thinking is not None:
-                self.soul.set_thinking(thinking)
-
-            # Use lambda to pass cancel_event via closure
+            snap = self.soul.status
+            runtime = self.soul.runtime if isinstance(self.soul, KimiSoul) else None
             await run_soul(
                 self.soul,
                 user_input,
                 lambda wire: visualize(
-                    wire,
-                    initial_status=self.soul.status,
+                    wire.ui_side(merge=False),  # shell UI maintain its own merge buffer
+                    initial_status=StatusUpdate(
+                        context_usage=snap.context_usage,
+                        context_tokens=snap.context_tokens,
+                        max_context_tokens=snap.max_context_tokens,
+                        mcp_status=snap.mcp_status,
+                    ),
                     cancel_event=cancel_event,
+                    prompt_session=self._prompt_session,
+                    steer=self.soul.steer if isinstance(self.soul, KimiSoul) else None,
+                    bind_running_input=self._bind_running_input,
+                    unbind_running_input=self._unbind_running_input,
                 ),
                 cancel_event,
+                runtime.session.wire_file if runtime else None,
+                runtime,
             )
             return True
         except LLMNotSet:
-            logger.error("LLM not set")
-            console.print("[red]LLM not set, send /setup to configure[/red]")
+            logger.exception("LLM not set:")
+            console.print('[red]LLM not set, send "/login" to login[/red]')
         except LLMNotSupported as e:
             # actually unsupported input/mode should already be blocked by prompt session
-            logger.error(
-                "LLM model '{model_name}' does not support required capabilities: {capabilities}",
-                model_name=e.llm.model_name,
-                capabilities=", ".join(e.capabilities),
-            )
+            logger.exception("LLM not supported:")
             console.print(f"[red]{e}[/red]")
         except ChatProviderError as e:
             logger.exception("LLM provider error:")
             if isinstance(e, APIStatusError) and e.status_code == 401:
-                console.print("[red]Authorization failed, please check your API key[/red]")
+                console.print("[red]Authorization failed, please check your login status[/red]")
             elif isinstance(e, APIStatusError) and e.status_code == 402:
                 console.print("[red]Membership expired, please renew your plan[/red]")
             elif isinstance(e, APIStatusError) and e.status_code == 403:
@@ -214,27 +481,31 @@ class ShellApp:
                 console.print(f"[red]LLM provider error: {e}[/red]")
         except MaxStepsReached as e:
             logger.warning("Max steps reached: {n_steps}", n_steps=e.n_steps)
-            console.print(f"[yellow]Max steps reached: {e.n_steps}[/yellow]")
+            console.print(f"[yellow]{e}[/yellow]")
         except RunCancelled:
             logger.info("Cancelled by user")
             console.print("[red]Interrupted by user[/red]")
-        except BaseException as e:
-            logger.exception("Unknown error:")
-            console.print(f"[red]Unknown error: {e}[/red]")
+        except Exception as e:
+            logger.exception("Unexpected error:")
+            console.print(f"[red]Unexpected error: {e}[/red]")
             raise  # re-raise unknown error
         finally:
             remove_sigint()
         return False
 
     async def _auto_update(self) -> None:
-        toast("checking for updates...", duration=2.0)
+        toast("checking for updates...", topic="update", duration=2.0)
         result = await do_update(print=False, check_only=True)
         if result == UpdateResult.UPDATE_AVAILABLE:
             while True:
-                toast("new version found, run `uv tool upgrade kimi-cli` to upgrade", duration=30.0)
+                toast(
+                    f"new version found, run `{_update_mod.UPGRADE_COMMAND}` to upgrade",
+                    topic="update",
+                    duration=30.0,
+                )
                 await asyncio.sleep(60.0)
         elif result == UpdateResult.UPDATED:
-            toast("auto updated, restart to use the new version", duration=5.0)
+            toast("auto updated, restart to use the new version", topic="update", duration=5.0)
 
     def _start_background_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
@@ -251,6 +522,12 @@ class ShellApp:
 
         task.add_done_callback(_cleanup)
         return task
+
+    def _cancel_background_tasks(self) -> None:
+        """Cancel all background tasks (notification watcher, auto-update, etc.)."""
+        for task in self._background_tasks:
+            task.cancel()
+        self._background_tasks.clear()
 
 
 _KIMI_BLUE = "dodger_blue1"
@@ -275,7 +552,7 @@ class WelcomeInfoItem:
 
 
 def _print_welcome_info(name: str, info_items: list[WelcomeInfoItem]) -> None:
-    head = Text.from_markup(f"[bold]Welcome to {name}![/bold]")
+    head = Text.from_markup("Welcome to Kimi Code CLI!")
     help_text = Text.from_markup("[grey50]Send /help for help information.[/grey50]")
 
     # Use Table for precise width control
@@ -287,7 +564,8 @@ def _print_welcome_info(name: str, info_items: list[WelcomeInfoItem]) -> None:
 
     rows: list[RenderableType] = [table]
 
-    rows.append(Text(""))  # Empty line
+    if info_items:
+        rows.append(Text(""))  # empty line
     for item in info_items:
         rows.append(Text(f"{item.name}: {item.value}", style=item.level.value))
 
@@ -299,7 +577,7 @@ def _print_welcome_info(name: str, info_items: list[WelcomeInfoItem]) -> None:
             rows.append(
                 Text.from_markup(
                     f"\n[yellow]New version available: {latest_version}. "
-                    "Please run `uv tool upgrade kimi-cli` to upgrade.[/yellow]"
+                    f"Please run `{_update_mod.UPGRADE_COMMAND}` to upgrade.[/yellow]"
                 )
             )
 

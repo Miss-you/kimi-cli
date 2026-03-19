@@ -1,4 +1,5 @@
 # This file is modified from https://github.com/Textualize/rich/blob/4d6d631a3d2deddf8405522d4b8c976a6d35726c/rich/markdown.py
+# pyright: standard
 
 from __future__ import annotations
 
@@ -17,9 +18,11 @@ from rich.jupyter import JupyterMixin
 from rich.rule import Rule
 from rich.segment import Segment
 from rich.style import Style, StyleStack
-from rich.syntax import Syntax
+from rich.syntax import Syntax, SyntaxTheme
 from rich.table import Table
 from rich.text import Text, TextType
+
+from kimi_cli.utils.rich.syntax import KIMI_ANSI_THEME_NAME, resolve_code_theme
 
 LIST_INDENT_WIDTH = 2
 
@@ -219,7 +222,7 @@ class CodeBlock(TextElement):
         lexer_name = node_info.partition(" ")[0]
         return cls(lexer_name or "text", markdown.code_theme)
 
-    def __init__(self, lexer_name: str, theme: str) -> None:
+    def __init__(self, lexer_name: str, theme: str | SyntaxTheme) -> None:
         self.lexer_name = lexer_name
         self.theme = theme
 
@@ -550,7 +553,7 @@ class MarkdownContext:
         style: Style,
         fallback_styles: Mapping[str, Style],
         inline_code_lexer: str | None = None,
-        inline_code_theme: str = "monokai",
+        inline_code_theme: str | SyntaxTheme = KIMI_ANSI_THEME_NAME,
     ) -> None:
         self.console = console
         self.options = options
@@ -609,7 +612,7 @@ class Markdown(JupyterMixin):
 
     Args:
         markup (str): A string containing markdown.
-        code_theme (str, optional): Pygments theme for code blocks. Defaults to "monokai".
+        code_theme (str, optional): Pygments theme for code blocks. Defaults to "kimi-ansi".
             See https://pygments.org/styles/ for code themes.
         justify (JustifyMethod, optional): Justify value for paragraphs. Defaults to None.
         style (Union[str, Style], optional): Optional style to apply to markdown.
@@ -644,7 +647,7 @@ class Markdown(JupyterMixin):
     def __init__(
         self,
         markup: str,
-        code_theme: str = "monokai",
+        code_theme: str = KIMI_ANSI_THEME_NAME,
         justify: JustifyMethod | None = None,
         style: str | Style = "none",
         hyperlinks: bool = True,
@@ -654,12 +657,12 @@ class Markdown(JupyterMixin):
         parser = MarkdownIt().enable("strikethrough").enable("table")
         self.markup = markup
         self.parsed = parser.parse(markup)
-        self.code_theme = code_theme
+        self.code_theme = resolve_code_theme(code_theme)
         self.justify: JustifyMethod | None = justify
         self.style = style
         self.hyperlinks = hyperlinks
         self.inline_code_lexer = inline_code_lexer
-        self.inline_code_theme = inline_code_theme or code_theme
+        self.inline_code_theme = resolve_code_theme(inline_code_theme or code_theme)
 
     def _flatten_tokens(self, tokens: Iterable[Token]) -> Iterable[Token]:
         """Flattens the token stream."""
@@ -697,8 +700,23 @@ class Markdown(JupyterMixin):
             exiting = token.nesting == -1
             self_closing = token.nesting == 0
 
-            if node_type == "text":
-                context.on_text(token.content, node_type)
+            if node_type in {"text", "html_inline", "html_block"}:
+                # Render HTML tokens as plain text so safeword markup stays visible.
+                if context.stack:
+                    context.on_text(token.content, node_type)
+                else:
+                    # Orphan text/html blocks can appear outside any element (e.g. <analysis>).
+                    paragraph = Paragraph(justify=self.justify or "left")
+                    paragraph.on_enter(context)
+                    paragraph.on_text(context, token.content)
+                    paragraph.on_leave(context)
+                    if new_line and render_started:
+                        yield _new_line_segment
+                    rendered = console.render(paragraph, context.options)
+                    for segment in rendered:
+                        render_started = True
+                        yield segment
+                    new_line = paragraph.new_line
             elif node_type == "hardbreak":
                 context.on_text("\n", node_type)
             elif node_type == "softbreak":
@@ -812,8 +830,8 @@ if __name__ == "__main__":
         "-t",
         "--code-theme",
         dest="code_theme",
-        default="monokai",
-        help="pygments code theme",
+        default=KIMI_ANSI_THEME_NAME,
+        help='code theme (pygments name or "kimi-ansi")',
     )
     parser.add_argument(
         "-i",

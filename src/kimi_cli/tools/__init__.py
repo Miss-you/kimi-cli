@@ -1,8 +1,8 @@
 import json
-from pathlib import Path
 from typing import cast
 
-import streamingjson  # pyright: ignore[reportMissingTypeStubs]
+import streamingjson  # type: ignore[reportMissingTypeStubs]
+from kaos.path import KaosPath
 from kosong.utils.typing import JsonType
 
 from kimi_cli.utils.string import shorten_middle
@@ -31,19 +31,39 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
             if not isinstance(curr_args, dict) or not curr_args.get("description"):
                 return None
             key_argument = str(curr_args["description"])
+        case "CreateSubagent":
+            if not isinstance(curr_args, dict) or not curr_args.get("name"):
+                return None
+            key_argument = str(curr_args["name"])
         case "SendDMail":
-            return "El Psy Kongroo"
+            return None
         case "Think":
             if not isinstance(curr_args, dict) or not curr_args.get("thought"):
                 return None
             key_argument = str(curr_args["thought"])
         case "SetTodoList":
             return None
-        case "Bash":
+        case "Shell":
             if not isinstance(curr_args, dict) or not curr_args.get("command"):
                 return None
             key_argument = str(curr_args["command"])
+        case "TaskOutput":
+            if not isinstance(curr_args, dict) or not curr_args.get("task_id"):
+                return None
+            key_argument = str(curr_args["task_id"])
+        case "TaskList":
+            if not isinstance(curr_args, dict):
+                return None
+            key_argument = "active" if curr_args.get("active_only", True) else "all"
+        case "TaskStop":
+            if not isinstance(curr_args, dict) or not curr_args.get("task_id"):
+                return None
+            key_argument = str(curr_args["task_id"])
         case "ReadFile":
+            if not isinstance(curr_args, dict) or not curr_args.get("path"):
+                return None
+            key_argument = _normalize_path(str(curr_args["path"]))
+        case "ReadMediaFile":
             if not isinstance(curr_args, dict) or not curr_args.get("path"):
                 return None
             key_argument = _normalize_path(str(curr_args["path"]))
@@ -74,7 +94,7 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
         case _:
             if isinstance(json_content, streamingjson.Lexer):
                 # lexer.json_content is list[str] based on streamingjson source code
-                content: list[str] = cast(list[str], json_content.json_content)  # pyright: ignore[reportUnknownMemberType]
+                content: list[str] = cast(list[str], json_content.json_content)  # type: ignore[reportUnknownMemberType]
                 key_argument = "".join(content)
             else:
                 key_argument = json_content
@@ -83,7 +103,7 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
 
 
 def _normalize_path(path: str) -> str:
-    cwd = str(Path.cwd().absolute())
+    cwd = str(KaosPath.cwd().canonical())
     if path.startswith(cwd):
         path = path[len(cwd) :].lstrip("/\\")
     return path

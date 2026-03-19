@@ -1,24 +1,31 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import sys
 from functools import partial
 from pathlib import Path
 
-import aiofiles
 from kosong.chat_provider import ChatProviderError
 from kosong.message import Message
 from rich import print
 
 from kimi_cli.cli import InputFormat, OutputFormat
-from kimi_cli.soul import LLMNotSet, MaxStepsReached, RunCancelled, Soul, run_soul
+from kimi_cli.soul import (
+    LLMNotSet,
+    LLMNotSupported,
+    MaxStepsReached,
+    RunCancelled,
+    Soul,
+    run_soul,
+)
+from kimi_cli.soul.kimisoul import KimiSoul
+from kimi_cli.ui.print.visualize import visualize
 from kimi_cli.utils.logging import logger
-from kimi_cli.utils.message import message_extract_text
 from kimi_cli.utils.signals import install_sigint_handler
-from kimi_cli.wire import WireUISide
-from kimi_cli.wire.message import StepInterrupted
 
 
-class PrintApp:
+class Print:
     """
     An app implementation that prints the agent behavior to the console.
 
@@ -27,6 +34,7 @@ class PrintApp:
         input_format (InputFormat): The input format to use.
         output_format (OutputFormat): The output format to use.
         context_file (Path): The file to store the context.
+        final_only (bool): Whether to only print the final assistant message.
     """
 
     def __init__(
@@ -35,11 +43,14 @@ class PrintApp:
         input_format: InputFormat,
         output_format: OutputFormat,
         context_file: Path,
+        *,
+        final_only: bool = False,
     ):
         self.soul = soul
-        self.input_format = input_format
-        self.output_format = output_format
+        self.input_format: InputFormat = input_format
+        self.output_format: OutputFormat = output_format
         self.context_file = context_file
+        self.final_only = final_only
 
     async def run(self, command: str | None = None) -> bool:
         cancel_event = asyncio.Event()
@@ -68,26 +79,33 @@ class PrintApp:
 
                 if command:
                     logger.info("Running agent with command: {command}", command=command)
-                    if self.output_format == "text":
-                        visualize_fn = self._visualize_text
+                    if self.output_format == "text" and not self.final_only:
                         print(command)
-                    else:
-                        assert self.output_format == "stream-json"
-                        visualize_fn = partial(self._visualize_stream_json, start_position=0)
-                    await run_soul(self.soul, command, visualize_fn, cancel_event)
+                    runtime = self.soul.runtime if isinstance(self.soul, KimiSoul) else None
+                    await run_soul(
+                        self.soul,
+                        command,
+                        partial(visualize, self.output_format, self.final_only),
+                        cancel_event,
+                        runtime.session.wire_file if runtime else None,
+                        runtime,
+                    )
                 else:
                     logger.info("Empty command, skipping")
 
                 command = None
-        except LLMNotSet:
-            logger.error("LLM not set")
-            print("LLM not set")
+        except LLMNotSet as e:
+            logger.exception("LLM not set:")
+            print(str(e))
+        except LLMNotSupported as e:
+            logger.exception("LLM not supported:")
+            print(str(e))
         except ChatProviderError as e:
             logger.exception("LLM provider error:")
-            print(f"LLM provider error: {e}")
+            print(str(e))
         except MaxStepsReached as e:
             logger.warning("Max steps reached: {n_steps}", n_steps=e.n_steps)
-            print(f"Max steps reached: {e.n_steps}")
+            print(str(e))
         except RunCancelled:
             logger.error("Interrupted by user")
             print("Interrupted by user")
@@ -115,7 +133,7 @@ class PrintApp:
                 data = json.loads(json_line)
                 message = Message.model_validate(data)
                 if message.role == "user":
-                    return message_extract_text(message)
+                    return message.extract_text(sep="\n")
                 logger.warning(
                     "Ignoring message with role `{role}`: {json_line}",
                     role=message.role,
@@ -123,31 +141,3 @@ class PrintApp:
                 )
             except Exception:
                 logger.warning("Ignoring invalid user message: {json_line}", json_line=json_line)
-
-    async def _visualize_text(self, wire: WireUISide):
-        while True:
-            msg = await wire.receive()
-            print(msg)
-            if isinstance(msg, StepInterrupted):
-                break
-
-    async def _visualize_stream_json(self, wire: WireUISide, start_position: int):
-        # TODO: be aware of context compaction
-        # FIXME: this is only a temporary impl, may miss the last lines of the context file
-        if not self.context_file.exists():
-            self.context_file.touch()
-        async with aiofiles.open(self.context_file, encoding="utf-8") as f:
-            await f.seek(start_position)
-            while True:
-                should_end = False
-                while (msg := wire.receive_nowait()) is not None:
-                    if isinstance(msg, StepInterrupted):
-                        should_end = True
-
-                line = await f.readline()
-                if not line:
-                    if should_end:
-                        break
-                    await asyncio.sleep(0.1)
-                    continue
-                print(line, end="")
