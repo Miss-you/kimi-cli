@@ -14,7 +14,7 @@ kimi --agent okabe
 
 The default agent, suitable for general use. Enabled tools:
 
-`Task`, `AskUserQuestion`, `SetTodoList`, `Shell`, `ReadFile`, `ReadMediaFile`, `Glob`, `Grep`, `WriteFile`, `StrReplaceFile`, `SearchWeb`, `FetchURL`, `EnterPlanMode`, `ExitPlanMode`, `TaskList`, `TaskOutput`, `TaskStop`
+`Agent`, `AskUserQuestion`, `SetTodoList`, `Shell`, `ReadFile`, `ReadMediaFile`, `Glob`, `Grep`, `WriteFile`, `StrReplaceFile`, `SearchWeb`, `FetchURL`, `EnterPlanMode`, `ExitPlanMode`, `TaskList`, `TaskOutput`, `TaskStop`
 
 ### `okabe`
 
@@ -71,14 +71,14 @@ agent:
 
 ## System prompt built-in parameters
 
-The system prompt file is a Markdown template that can use `${VAR}` syntax to reference variables. Built-in variables include:
+The system prompt file is a Markdown template that can use `${VAR}` syntax to reference variables and supports the Jinja2 `{% include %}` directive to include other files. Built-in variables include:
 
 | Variable | Description |
 |----------|-------------|
 | `${KIMI_NOW}` | Current time (ISO format) |
 | `${KIMI_WORK_DIR}` | Working directory path |
 | `${KIMI_WORK_DIR_LS}` | Working directory file list |
-| `${KIMI_AGENTS_MD}` | AGENTS.md file content (if exists) |
+| `${KIMI_AGENTS_MD}` | Merged `AGENTS.md` content from project root to working directory (including `.kimi/AGENTS.md`) |
 | `${KIMI_SKILLS}` | Loaded skills list |
 | `${KIMI_ADDITIONAL_DIRS_INFO}` | Information about additional directories added via `--add-dir` or `/add-dir` |
 
@@ -106,7 +106,7 @@ ${MY_VAR}
 
 ## Defining subagents in agent files
 
-Subagents can handle specific types of tasks. After defining subagents in an agent file, the main agent can launch them via the `Task` tool:
+Subagents can handle specific types of tasks. After defining subagents in an agent file, the main agent can launch them via the `Agent` tool:
 
 ```yaml
 version: 1
@@ -121,7 +121,7 @@ agent:
       description: "Code review expert"
 ```
 
-Subagent files are also standard agent format, typically inheriting from the main agent and excluding certain tools:
+Subagent files are also standard agent format, typically inheriting from the main agent:
 
 ```yaml
 # coder-sub.yaml
@@ -131,42 +131,47 @@ agent:
   system_prompt_args:
     ROLE_ADDITIONAL: |
       You are now running as a subagent...
-  exclude_tools:
-    - "kimi_cli.tools.multiagent:Task"  # Exclude Task tool to avoid nesting
 ```
+
+## Built-in subagent types
+
+The default agent configuration includes three built-in subagent types, each with different tool policies and use cases:
+
+| Type | Purpose | Available tools |
+|------|---------|----------------|
+| `coder` | General software engineering: read/write files, run commands, search code | `Shell`, `ReadFile`, `ReadMediaFile`, `Glob`, `Grep`, `WriteFile`, `StrReplaceFile`, `SearchWeb`, `FetchURL` |
+| `explore` | Fast read-only codebase exploration: search, read, summarize | `Shell`, `ReadFile`, `ReadMediaFile`, `Glob`, `Grep`, `SearchWeb`, `FetchURL` (no write tools) |
+| `plan` | Implementation planning and architecture design: analyze files, create plans | `ReadFile`, `ReadMediaFile`, `Glob`, `Grep`, `SearchWeb`, `FetchURL` (no Shell, no write tools) |
+
+All subagent types are prohibited from nesting the `Agent` tool (subagents cannot create their own subagents). The `Agent` tool is only available to the root agent.
 
 ## How subagents run
 
-Subagents launched via the `Task` tool run in an isolated context and return results to the main agent when complete. Advantages of this approach:
+Subagents launched via the `Agent` tool run in an isolated context and return results to the main agent when complete. Each subagent instance maintains its own context history and metadata under `subagents/<agent_id>/` in the session directory, and can be resumed across multiple invocations. Advantages of this approach:
 
 - Isolated context, avoiding pollution of main agent's conversation history
 - Multiple independent tasks can be processed in parallel
 - Subagents can have targeted system prompts
-
-## Dynamic subagent creation
-
-`CreateSubagent` is an advanced tool that allows AI to dynamically define new subagent types at runtime (not enabled by default). Dynamically created subagents are persisted with the session state and automatically restored when resuming the session. To use it, add to your agent file:
-
-```yaml
-agent:
-  tools:
-    - "kimi_cli.tools.multiagent:CreateSubagent"
-```
+- Persistent instances preserve context across multiple calls
 
 ## Built-in tools list
 
 The following are all built-in tools in Kimi Code CLI.
 
-### `Task`
+### `Agent`
 
-- **Path**: `kimi_cli.tools.multiagent:Task`
-- **Description**: Dispatch a subagent to execute a task. Subagents cannot access the main agent's context; all necessary information must be provided in the prompt.
+- **Path**: `kimi_cli.tools.agent:Agent`
+- **Description**: Start or resume a subagent instance for a focused task. Three built-in subagent types are available: `coder` (general software engineering), `explore` (fast read-only codebase exploration), and `plan` (implementation planning and architecture design). Each instance maintains its own context history and supports foreground or background execution.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `description` | string | Short task description (3-5 words) |
-| `subagent_name` | string | Subagent name |
 | `prompt` | string | Detailed task description |
+| `subagent_type` | string | Built-in subagent type, default `coder` |
+| `model` | string | Optional model override |
+| `resume` | string | Optional agent instance ID to resume an existing instance |
+| `run_in_background` | bool | Whether to run in background, default false |
+| `timeout` | int | Timeout in seconds, range 30–3600. Foreground defaults to no timeout (runs until completion), background defaults to 15 minutes; the task is stopped if the limit is exceeded |
 
 ### `AskUserQuestion`
 
@@ -186,11 +191,11 @@ The following are all built-in tools in Kimi Code CLI.
 ### `SetTodoList`
 
 - **Path**: `kimi_cli.tools.todo:SetTodoList`
-- **Description**: Manage todo list, track task progress
+- **Description**: Manage todo list, track task progress. Supports three usage modes: update mode (pass `todos` array to replace the entire list), query mode (omit `todos` to return the current list), and clear mode (pass an empty array `[]` to clear the list). Todo items are persisted to session state.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `todos` | array | Todo list items |
+| `todos` | array \| null | Todo list items. Omit to query the current list; pass `[]` to clear |
 | `todos[].title` | string | Todo item title |
 | `todos[].status` | string | Status: `pending`, `in_progress`, `done` |
 
@@ -211,12 +216,12 @@ When `run_in_background=true`, the command is launched as a background task and 
 ### `ReadFile`
 
 - **Path**: `kimi_cli.tools.file:ReadFile`
-- **Description**: Read text file content. Max 1000 lines per read, max 2000 characters per line. Files outside working directory require absolute paths.
+- **Description**: Read text file content. Max 1000 lines per read, max 2000 characters per line. Files outside working directory require absolute paths. Every read returns the total number of lines in the file. Sensitive files (such as `.env`, SSH private keys, and cloud credentials) are rejected.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `path` | string | File path |
-| `line_offset` | int | Starting line number, default 1 |
+| `line_offset` | int | Starting line number, default 1. Supports negative values to read from the end of the file (e.g. `-100` reads the last 100 lines); absolute value cannot exceed 1000 |
 | `n_lines` | int | Number of lines to read, default/max 1000 |
 
 ### `ReadMediaFile`
@@ -231,7 +236,7 @@ When `run_in_background=true`, the command is launched as a background task and 
 ### `Glob`
 
 - **Path**: `kimi_cli.tools.file:Glob`
-- **Description**: Match files and directories by pattern. Returns max 1000 matches, patterns starting with `**` not allowed.
+- **Description**: Match files and directories by pattern. Returns max 1000 matches, patterns starting with `**` not allowed. Can also search within discovered skill roots, and `~` in paths is expanded to the user's home directory.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -242,7 +247,7 @@ When `run_in_background=true`, the command is launched as a background task and 
 ### `Grep`
 
 - **Path**: `kimi_cli.tools.file:Grep`
-- **Description**: Search file content with regular expressions, based on ripgrep
+- **Description**: Search file content with regular expressions, based on ripgrep. Hidden files (dotfiles) are searched by default, but files excluded by `.gitignore` are not. Sensitive files (such as `.env`, SSH private keys, and cloud credentials) are always filtered out, even when `include_ignored` is set.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -254,10 +259,12 @@ When `run_in_background=true`, the command is launched as a background task and 
 | `-B` | int | Show N lines before match |
 | `-A` | int | Show N lines after match |
 | `-C` | int | Show N lines before and after match |
-| `-n` | bool | Show line numbers |
+| `-n` | bool | Show line numbers, default true |
 | `-i` | bool | Case insensitive |
 | `multiline` | bool | Enable multiline matching |
-| `head_limit` | int | Limit output lines |
+| `head_limit` | int | Limit output lines, default 250 |
+| `offset` | int | Skip first N results for pagination, default 0 |
+| `include_ignored` | bool | Search files excluded by `.gitignore` (e.g. `node_modules`, build artifacts), default false |
 
 ### `WriteFile`
 
@@ -351,12 +358,12 @@ This tool takes no parameters.
 ### `TaskOutput`
 
 - **Path**: `kimi_cli.tools.background:TaskOutput`
-- **Description**: Retrieve output and status of a background task. Supports blocking wait or non-blocking query. Returns structured task metadata and an output preview; use `ReadFile` with the returned `output_path` to read the full log if output is truncated.
+- **Description**: Retrieve output and status of a background task. Returns a non-blocking status/output snapshot by default; use `ReadFile` with the returned `output_path` to read the full log if output is truncated.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `task_id` | string | Task ID to query |
-| `block` | bool | Whether to wait for task completion, default true |
+| `block` | bool | Whether to wait for task completion, default false |
 | `timeout` | int | Maximum wait time in seconds when `block=true` (0–3600), default 30 |
 
 ### `TaskStop`
@@ -369,15 +376,6 @@ This tool takes no parameters.
 | `task_id` | string | Task ID to stop |
 | `reason` | string | Reason for stopping (optional), default "Stopped by TaskStop" |
 
-### `CreateSubagent`
-
-- **Path**: `kimi_cli.tools.multiagent:CreateSubagent`
-- **Description**: Dynamically create subagents
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | string | Unique name for the subagent, used to reference in `Task` tool |
-| `system_prompt` | string | System prompt defining agent's role, capabilities, and boundaries |
 
 ## Tool security boundaries
 

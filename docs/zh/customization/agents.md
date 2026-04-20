@@ -14,7 +14,7 @@ kimi --agent okabe
 
 默认 Agent，适合通常情况使用。启用的工具：
 
-`Task`、`AskUserQuestion`、`SetTodoList`、`Shell`、`ReadFile`、`ReadMediaFile`、`Glob`、`Grep`、`WriteFile`、`StrReplaceFile`、`SearchWeb`、`FetchURL`、`EnterPlanMode`、`ExitPlanMode`、`TaskList`、`TaskOutput`、`TaskStop`
+`Agent`、`AskUserQuestion`、`SetTodoList`、`Shell`、`ReadFile`、`ReadMediaFile`、`Glob`、`Grep`、`WriteFile`、`StrReplaceFile`、`SearchWeb`、`FetchURL`、`EnterPlanMode`、`ExitPlanMode`、`TaskList`、`TaskOutput`、`TaskStop`
 
 ### `okabe`
 
@@ -71,14 +71,14 @@ agent:
 
 ## 系统提示词内置参数
 
-系统提示词文件是一个 Markdown 模板，可以使用 `${VAR}` 语法引用变量。内置变量包括：
+系统提示词文件是一个 Markdown 模板，可以使用 `${VAR}` 语法引用变量，也支持 Jinja2 的 `{% include %}` 指令来引入其他文件。内置变量包括：
 
 | 变量 | 说明 |
 |------|------|
 | `${KIMI_NOW}` | 当前时间（ISO 格式） |
 | `${KIMI_WORK_DIR}` | 工作目录路径 |
 | `${KIMI_WORK_DIR_LS}` | 工作目录文件列表 |
-| `${KIMI_AGENTS_MD}` | AGENTS.md 文件内容（如果存在） |
+| `${KIMI_AGENTS_MD}` | 从项目根目录到工作目录逐层合并的 `AGENTS.md` 内容（包括 `.kimi/AGENTS.md`） |
 | `${KIMI_SKILLS}` | 加载的 Skills 列表 |
 | `${KIMI_ADDITIONAL_DIRS_INFO}` | 通过 `--add-dir` 或 `/add-dir` 添加的额外目录信息 |
 
@@ -106,7 +106,7 @@ ${MY_VAR}
 
 ## 在 Agent 文件中定义子 Agent
 
-子 Agent 可以处理特定类型的任务。在 Agent 文件中定义子 Agent 后，主 Agent 可以通过 `Task` 工具启动它们：
+子 Agent 可以处理特定类型的任务。在 Agent 文件中定义子 Agent 后，主 Agent 可以通过 `Agent` 工具启动它们：
 
 ```yaml
 version: 1
@@ -121,7 +121,7 @@ agent:
       description: "代码审查专家"
 ```
 
-子 Agent 文件也是标准的 Agent 格式，通常会继承主 Agent 并排除某些工具：
+子 Agent 文件也是标准的 Agent 格式，通常会继承主 Agent：
 
 ```yaml
 # coder-sub.yaml
@@ -131,42 +131,47 @@ agent:
   system_prompt_args:
     ROLE_ADDITIONAL: |
       你现在作为子 Agent 运行...
-  exclude_tools:
-    - "kimi_cli.tools.multiagent:Task"  # 排除 Task 工具，避免嵌套
 ```
+
+## 内置子 Agent 类型
+
+默认 Agent 配置包含三种内置子 Agent 类型，各自有不同的工具策略和适用场景：
+
+| 类型 | 用途 | 可用工具 |
+|------|------|---------|
+| `coder` | 通用软件工程：读写文件、运行命令、搜索代码 | `Shell`、`ReadFile`、`ReadMediaFile`、`Glob`、`Grep`、`WriteFile`、`StrReplaceFile`、`SearchWeb`、`FetchURL` |
+| `explore` | 快速只读代码探索：搜索、阅读、总结 | `Shell`、`ReadFile`、`ReadMediaFile`、`Glob`、`Grep`、`SearchWeb`、`FetchURL`（无写入工具） |
+| `plan` | 实现规划与架构设计：分析文件、制定方案 | `ReadFile`、`ReadMediaFile`、`Glob`、`Grep`、`SearchWeb`、`FetchURL`（无 Shell、无写入工具） |
+
+所有子 Agent 类型均不可嵌套使用 `Agent` 工具（即子 Agent 不能创建自己的子 Agent）。`Agent` 工具仅在根 Agent 中可用。
 
 ## 子 Agent 的运行方式
 
-通过 `Task` 工具启动的子 Agent 会在独立的上下文中运行，完成后将结果返回给主 Agent。这种方式的优势：
+通过 `Agent` 工具启动的子 Agent 会在独立的上下文中运行，完成后将结果返回给主 Agent。每个子 Agent 实例在会话目录的 `subagents/<agent_id>/` 下维护独立的上下文历史和元数据，可以被多次恢复继续使用。这种方式的优势：
 
 - 隔离上下文，避免污染主 Agent 的对话历史
 - 可以并行处理多个独立任务
 - 子 Agent 可以有针对性的系统提示词
-
-## 动态创建子 Agent
-
-`CreateSubagent` 是一个高级工具，允许 AI 在运行时动态定义新的子 Agent 类型（默认未启用）。动态创建的子 Agent 会随会话状态持久化，恢复会话时自动还原。如需使用，在 Agent 文件中添加：
-
-```yaml
-agent:
-  tools:
-    - "kimi_cli.tools.multiagent:CreateSubagent"
-```
+- 持久实例可跨多次调用保留上下文
 
 ## 内置工具列表
 
 以下是 Kimi Code CLI 内置的所有工具。
 
-### `Task`
+### `Agent`
 
-- **路径**：`kimi_cli.tools.multiagent:Task`
-- **描述**：调度子 Agent 执行任务。子 Agent 无法访问主 Agent 的上下文，需在 prompt 中提供所有必要信息。
+- **路径**：`kimi_cli.tools.agent:Agent`
+- **描述**：启动或恢复子 Agent 实例处理聚焦任务。内置三种子 Agent 类型：`coder`（通用软件工程）、`explore`（快速只读代码探索）、`plan`（实现规划与架构设计）。每个实例维护独立的上下文历史，支持前台或后台运行。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `description` | string | 任务简短描述（3-5 词） |
-| `subagent_name` | string | 子 Agent 名称 |
 | `prompt` | string | 任务详细描述 |
+| `subagent_type` | string | 内置子 Agent 类型，默认 `coder` |
+| `model` | string | 可选的模型覆盖 |
+| `resume` | string | 可选的 Agent 实例 ID，用于恢复现有实例 |
+| `run_in_background` | bool | 是否在后台运行，默认 false |
+| `timeout` | int | 超时时间（秒），范围 30–3600。前台默认无超时（运行到完成），后台默认 15 分钟；超时后任务会被停止 |
 
 ### `AskUserQuestion`
 
@@ -186,11 +191,11 @@ agent:
 ### `SetTodoList`
 
 - **路径**：`kimi_cli.tools.todo:SetTodoList`
-- **描述**：管理待办事项列表，跟踪任务进度
+- **描述**：管理待办事项列表，跟踪任务进度。支持三种使用模式：更新模式（传入 `todos` 数组替换整个列表）、查询模式（省略 `todos` 参数返回当前列表）和清空模式（传入空数组 `[]` 清空列表）。待办事项会持久化到会话状态。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `todos` | array | 待办事项列表 |
+| `todos` | array \| null | 待办事项列表。省略时查询当前列表；传入 `[]` 清空列表 |
 | `todos[].title` | string | 待办事项标题 |
 | `todos[].status` | string | 状态：`pending`、`in_progress`、`done` |
 
@@ -211,12 +216,12 @@ agent:
 ### `ReadFile`
 
 - **路径**：`kimi_cli.tools.file:ReadFile`
-- **描述**：读取文本文件内容。单次最多读取 1000 行，每行最多 2000 字符。工作目录外的文件需使用绝对路径。
+- **描述**：读取文本文件内容。单次最多读取 1000 行，每行最多 2000 字符。工作目录外的文件需使用绝对路径。每次读取都会在消息中返回文件总行数。敏感文件（如 `.env`、SSH 私钥、云凭据）会被拒绝读取。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `path` | string | 文件路径 |
-| `line_offset` | int | 起始行号，默认 1 |
+| `line_offset` | int | 起始行号，默认 1。支持负数表示从文件末尾读取（如 `-100` 读取最后 100 行），绝对值不超过 1000 |
 | `n_lines` | int | 读取行数，默认/最大 1000 |
 
 ### `ReadMediaFile`
@@ -231,7 +236,7 @@ agent:
 ### `Glob`
 
 - **路径**：`kimi_cli.tools.file:Glob`
-- **描述**：按模式匹配文件和目录。最多返回 1000 个匹配项，不允许以 `**` 开头的模式。
+- **描述**：按模式匹配文件和目录。最多返回 1000 个匹配项，不允许以 `**` 开头的模式。支持搜索已发现的 Skill 根目录，路径中的 `~` 会自动展开为用户主目录。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -242,7 +247,7 @@ agent:
 ### `Grep`
 
 - **路径**：`kimi_cli.tools.file:Grep`
-- **描述**：使用正则表达式搜索文件内容，基于 ripgrep 实现
+- **描述**：使用正则表达式搜索文件内容，基于 ripgrep 实现。默认搜索隐藏文件（dotfiles），但不搜索被 `.gitignore` 排除的文件。敏感文件（如 `.env`、SSH 私钥、云凭据）始终被过滤，即使设置了 `include_ignored` 也不会出现在结果中。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -254,10 +259,12 @@ agent:
 | `-B` | int | 显示匹配行前 N 行 |
 | `-A` | int | 显示匹配行后 N 行 |
 | `-C` | int | 显示匹配行前后 N 行 |
-| `-n` | bool | 显示行号 |
+| `-n` | bool | 显示行号，默认 true |
 | `-i` | bool | 忽略大小写 |
 | `multiline` | bool | 启用多行匹配 |
-| `head_limit` | int | 限制输出行数 |
+| `head_limit` | int | 限制输出行数，默认 250 |
+| `offset` | int | 跳过前 N 条结果，用于分页，默认 0 |
+| `include_ignored` | bool | 搜索被 `.gitignore` 排除的文件（如 `node_modules`、构建产物），默认 false |
 
 ### `WriteFile`
 
@@ -351,12 +358,12 @@ agent:
 ### `TaskOutput`
 
 - **路径**：`kimi_cli.tools.background:TaskOutput`
-- **描述**：获取后台任务的输出和状态。支持阻塞等待或非阻塞查询。返回结构化的任务元数据和输出预览；如果输出被截断，可使用 `ReadFile` 分页读取完整日志。
+- **描述**：获取后台任务的输出和状态。默认为非阻塞查询，返回当前状态和输出快照；如果输出被截断，可使用 `ReadFile` 分页读取完整日志。
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `task_id` | string | 要查询的任务 ID |
-| `block` | bool | 是否等待任务完成，默认 true |
+| `block` | bool | 是否等待任务完成，默认 false |
 | `timeout` | int | `block=true` 时的最大等待秒数（0–3600），默认 30 |
 
 ### `TaskStop`
@@ -369,15 +376,6 @@ agent:
 | `task_id` | string | 要停止的任务 ID |
 | `reason` | string | 停止原因（可选），默认 "Stopped by TaskStop" |
 
-### `CreateSubagent`
-
-- **路径**：`kimi_cli.tools.multiagent:CreateSubagent`
-- **描述**：动态创建子 Agent
-
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `name` | string | 子 Agent 的唯一名称，用于在 `Task` 工具中引用 |
-| `system_prompt` | string | 定义 Agent 角色、能力和边界的系统提示词 |
 
 ## 工具安全边界
 
